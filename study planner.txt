@@ -1,0 +1,329 @@
+import json
+import math
+import os
+from datetime import datetime, timedelta
+from collections import defaultdict
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ------------------------
+# Configuration / Helpers
+# ------------------------
+DATA_DIR = "study_planner_data"
+PROFILE_FILE = os.path.join(DATA_DIR, "profile.json")
+HISTORY_FILE = os.path.join(DATA_DIR, "history.csv")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def save_json(path, obj):
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+def load_json(path, default=None):
+    if not os.path.exists(path):
+        return default
+    with open(path, "r") as f:
+        return json.load(f)
+
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+# ------------------------
+# Data Models
+# ------------------------
+DEFAULT_PROFILE = {
+    "name": "Student",
+    "daily_available_minutes": 180,
+    "learning_style": "mixed",  # textual / visual / interactive / mixed
+    "subjects": {
+        # "Subject Name": { priority:1-5, difficulty:1-5, estimated_hours: float, strength:0-1 }
+        "Mathematics": {"priority": 5, "difficulty": 5, "estimated_hours": 40, "strength": 0.4},
+        "Physics": {"priority": 4, "difficulty": 4, "estimated_hours": 30, "strength": 0.5},
+        "Programming": {"priority": 3, "difficulty": 3, "estimated_hours": 25, "strength": 0.6},
+        "History": {"priority": 2, "difficulty": 2, "estimated_hours": 15, "strength": 0.8},
+    },
+    "points": 0,
+    "streak": 0,
+}
+
+# ------------------------
+# Core Logic
+# ------------------------
+class DataAnalyzer:
+    @staticmethod
+    def score_subject(s):
+        # s: dict with priority,difficulty,estimated_hours,strength
+        priority = clamp(float(s.get("priority", 3)), 1, 5)
+        difficulty = clamp(float(s.get("difficulty", 3)), 1, 5)
+        est = max(0.5, float(s.get("estimated_hours", 1)))
+        strength = clamp(float(s.get("strength", 0.5)), 0.0, 1.0)
+        # Weight formula: higher for priority, difficulty, estimated hours; lower if strength is high
+        weight = priority * difficulty * math.sqrt(est) * (1.0 + (1.0 - strength))
+        return weight
+
+    @staticmethod
+    def normalize(weights):
+        total = sum(weights.values())
+        if total == 0:
+            n = {k: 1.0/len(weights) for k in weights}
+        else:
+            n = {k: v/total for k, v in weights.items()}
+        return n
+
+class Planner:
+    def _init_(self, profile):
+        self.profile = profile
+
+    def generate_daily_plan(self, plan_date=None):
+        if plan_date is None:
+            plan_date = datetime.now().date()
+        subjects = self.profile["subjects"]
+        if not subjects:
+            return {"date": str(plan_date), "tasks": []}
+
+        # compute scores and normalized shares
+        weights = {name: DataAnalyzer.score_subject(s) for name, s in subjects.items()}
+        shares = DataAnalyzer.normalize(weights)
+        total_minutes = int(self.profile.get("daily_available_minutes", 180))
+        tasks = []
+        for name, share in shares.items():
+            minutes = max(15, int(round(total_minutes * share)))
+            tasks.append({
+                "subject": name,
+                "minutes": minutes,
+                "goal": f"Study {name} for {minutes} minutes",
+                "completed": False
+            })
+        tasks.sort(key=lambda t: -t["minutes"])
+        return {"date": str(plan_date), "tasks": tasks}
+
+    def generate_weekly_plan(self, start_date=None):
+        if start_date is None:
+            start_date = datetime.now().date()
+        week = []
+        for i in range(7):
+            d = start_date + timedelta(days=i)
+            week.append(self.generate_daily_plan(d))
+        return week
+
+class Feedback:
+    def _init_(self, profile):
+        self.profile = profile
+
+    def mark_complete(self, plan_day, task_idx):
+        try:
+            task = plan_day["tasks"][task_idx]
+        except Exception:
+            raise IndexError("Invalid task index")
+
+        if task["completed"]:
+            return False, "Already completed"
+        task["completed"] = True
+        points = max(1, int(task["minutes"] / 10))
+        self.profile["points"] += points
+        self.profile["streak"] += 1
+        return True, {"points_earned": points, "streak": self.profile["streak"]}
+
+    def miss_task(self, plan_day, task_idx):
+        try:
+            task = plan_day["tasks"][task_idx]
+        except Exception:
+            raise IndexError("Invalid task index")
+        if not task["completed"]:
+            self.profile["streak"] = 0
+            # slight penalty to strength estimate
+            subj = task["subject"]
+            s = self.profile["subjects"].get(subj)
+            if s:
+                s["strength"] = max(0.0, s["strength"] - 0.02)
+            return True, "Miss recorded"
+        return False, "Task was already completed"
+
+    def daily_summary(self, plan_day):
+        completed = sum(1 for t in plan_day["tasks"] if t["completed"])
+        total = len(plan_day["tasks"])
+        minutes_done = sum(t["minutes"] for t in plan_day["tasks"] if t["completed"])
+        minutes_total = sum(t["minutes"] for t in plan_day["tasks"])
+        summary = {
+            "date": plan_day["date"],
+            "completed_tasks": completed,
+            "total_tasks": total,
+            "minutes_done": minutes_done,
+            "minutes_total": minutes_total,
+            "points": self.profile["points"],
+            "streak": self.profile["streak"],
+        }
+        # append to CSV history
+        df_row = pd.DataFrame([summary])
+        if os.path.exists(HISTORY_FILE):
+            df_row.to_csv(HISTORY_FILE, mode="a", header=False, index=False)
+        else:
+            df_row.to_csv(HISTORY_FILE, index=False)
+        return summary
+
+class Recommender:
+    SAMPLE = {
+        "math": ["Khan Academy - practice problems", "Worked examples + past papers", "Formula sheet & flashcards"],
+        "physics": ["Conceptual videos", "Numerical problem sets", "Simulations (PhET)"],
+        "programming": ["Coding exercises (HackerRank)", "Mini-projects", "Code reviews"],
+        "default": ["Active recall cards", "Pomodoro (25/5)", "Short revision sessions (10-15 min)"]
+    }
+
+    def recommend(self, subject, learning_style="mixed"):
+        key = subject.lower()
+        for k in self.SAMPLE:
+            if k in key:
+                suggestions = self.SAMPLE[k]
+                break
+        else:
+            suggestions = self.SAMPLE["default"]
+
+        # adapt to learning style
+        if learning_style == "visual":
+            suggestions = [s + " (video/visual)" for s in suggestions]
+        elif learning_style == "interactive":
+            suggestions = [s + " (interactive exercises)" for s in suggestions]
+        return suggestions
+
+# ------------------------
+# Utilities for display (Notebook-friendly)
+# ------------------------
+def plan_to_dataframe(plan_day):
+    # plan_day: {"date":..., "tasks":[...]}
+    tasks = plan_day["tasks"]
+    if not tasks:
+        return pd.DataFrame(columns=["subject", "minutes", "goal", "completed"])
+    df = pd.DataFrame(tasks)
+    return df[["subject", "minutes", "goal", "completed"]]
+
+def weekly_summary_df(weekly_plan):
+    rows = []
+    for day in weekly_plan:
+        date = day["date"]
+        for t in day["tasks"]:
+            rows.append({"date": date, "subject": t["subject"], "minutes": t["minutes"], "completed": t["completed"]})
+    return pd.DataFrame(rows)
+
+def plot_time_allocation(profile, plan_day):
+    df = plan_to_dataframe(plan_day)
+    if df.empty:
+        print("No tasks to plot.")
+        return
+    agg = df.groupby("subject")["minutes"].sum().sort_values(ascending=False)
+    plt.figure(figsize=(7,4))
+    agg.plot(kind="bar")
+    plt.title(f"Time allocation for {plan_day['date']}")
+    plt.ylabel("Minutes")
+    plt.tight_layout()
+    plt.show()
+
+def plot_weekly_heatmap(weekly_plan):
+    df = weekly_summary_df(weekly_plan)
+    if df.empty:
+        print("No weekly data.")
+        return
+    pivot = df.pivot_table(index="subject", columns="date", values="minutes", aggfunc="sum", fill_value=0)
+    plt.figure(figsize=(10, max(3, 0.5*len(pivot))))
+    plt.imshow(pivot, aspect="auto")
+    plt.colorbar(label="Minutes")
+    plt.yticks(range(len(pivot.index)), pivot.index)
+    plt.xticks(range(len(pivot.columns)), pivot.columns, rotation=45)
+    plt.title("Weekly time allocation (minutes)")
+    plt.tight_layout()
+    plt.show()
+
+# ------------------------
+# High-level Agent Facade
+# ------------------------
+class StudyPlannerAgent:
+    def _init_(self, profile=None):
+        self.profile = profile if profile is not None else load_json(PROFILE_FILE, DEFAULT_PROFILE)
+        self.planner = Planner(self.profile)
+        self.feedback = Feedback(self.profile)
+        self.recommender = Recommender()
+        self.current_plan = None
+
+    def save_profile(self):
+        save_json(PROFILE_FILE, self.profile)
+
+    def create_daily_plan(self, date=None):
+        self.current_plan = self.planner.generate_daily_plan(date)
+        return self.current_plan
+
+    def create_weekly_plan(self, start_date=None):
+        return self.planner.generate_weekly_plan(start_date)
+
+    def show_plan_df(self):
+        if not self.current_plan:
+            print("No plan. Generate one with create_daily_plan().")
+            return pd.DataFrame()
+        return plan_to_dataframe(self.current_plan)
+
+    def mark_task_complete(self, idx):
+        ok, info = self.feedback.mark_complete(self.current_plan, idx)
+        return ok, info
+
+    def miss_task(self, idx):
+        ok, info = self.feedback.miss_task(self.current_plan, idx)
+        return ok, info
+
+    def daily_report(self):
+        return self.feedback.daily_summary(self.current_plan)
+
+    def recommend(self, subject):
+        return self.recommender.recommend(subject, self.profile.get("learning_style", "mixed"))
+
+# ------------------------
+# Demo / Example usage
+# ------------------------
+def demo_run():
+    print("=== Study Planner Agent Demo ===")
+    # Load or create profile
+    profile = load_json(PROFILE_FILE, DEFAULT_PROFILE.copy())
+    agent = StudyPlannerAgent(profile)
+
+    # Create today's plan
+    plan = agent.create_daily_plan()
+    df_plan = plan_to_dataframe(plan)
+    print("\nToday's Plan:")
+    display_df = df_plan.copy()
+    display_df["goal"] = display_df["goal"].str.replace("Study ", "")
+    print(display_df.to_string(index=False))
+
+    # Plot allocation
+    plot_time_allocation(profile, plan)
+
+    # Simulate marking first task complete
+    if plan["tasks"]:
+        ok, info = agent.mark_task_complete(0)
+        print("\nMark task 1 complete:", ok, info)
+
+    # Give a recommendation for top subject
+    top_subject = plan["tasks"][0]["subject"] if plan["tasks"] else None
+    if top_subject:
+        print("\nRecommendations for", top_subject)
+        for rec in agent.recommend(top_subject):
+            print(" -", rec)
+
+    # Daily summary & save
+    summary = agent.daily_report()
+    print("\nDaily summary:", summary)
+    agent.save_profile()
+
+    # Weekly plan & heatmap
+    weekly = agent.create_weekly_plan()
+    print("\nWeekly summary (per-day total minutes):")
+    for d in weekly:
+        tot = sum(t["minutes"] for t in d["tasks"])
+        print(f" {d['date']}: {tot} minutes across {len(d['tasks'])} tasks")
+    plot_weekly_heatmap(weekly)
+
+# ------------------------
+# If run as script / cell
+# ------------------------
+if _name_ == "_main_":
+    # If running in a notebook, you can import StudyPlannerAgent and call methods directly.
+    # Running as script will run a demo.
+    demo_run()
+
+
